@@ -165,7 +165,7 @@ def ask_claude(alert_data):
         f"not trigger an entry."
     )
     body = {
-        "model":      "claude-sonnet-4-20250514",
+        "model":      "claude-sonnet-4-6",
         "max_tokens": 400,
         "system":     ESS_SYSTEM,
         "messages":   [{"role": "user", "content": user_msg}]
@@ -176,7 +176,14 @@ def ask_claude(alert_data):
         json=body,
         timeout=30
     )
-    return r.json()["content"][0]["text"]
+    response = r.json()
+    print(f"Claude raw response: {response}")
+
+    if "content" not in response:
+        error_detail = response.get("error", {}).get("message", str(response))
+        raise Exception(f"Claude API error: {error_detail}")
+
+    return response["content"][0]["text"]
 
 def parse_action(analysis):
     for line in analysis.splitlines():
