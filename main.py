@@ -16,6 +16,9 @@ LBANK_BASE       = "https://api.lbkex.com"
 TRADE_SIZE_A     = 10.0
 TRADE_SIZE_AP    = 20.0
 
+# ================================================================
+# ESS FLOKI 8X SYSTEM PROMPT
+# ================================================================
 ESS_SYSTEM = """You are the ESS FLOKI 8X Swing Trading System analyst.
 
 CORE RULE: BTC determines market direction. FLOKI is ONLY traded LONG
@@ -69,6 +72,9 @@ Session: [London / NY / Off-hours]
 Action: [ENTER NOW / WAIT / NO TRADE]"""
 
 
+# ================================================================
+# LBANK FUNCTIONS
+# ================================================================
 def lbank_sign(params):
     sorted_params = "&".join(
         f"{k}={v}" for k, v in sorted(params.items())
@@ -100,7 +106,8 @@ def get_balance(asset="usdt"):
         params["sign"] = lbank_sign(params)
         r = requests.post(
             f"{LBANK_BASE}/v2/user_info.do",
-            data=params, timeout=10
+            data=params,
+            timeout=10
         )
         funds = r.json().get("data", {}).get("info", {}).get("free", {})
         return float(funds.get(asset, 0))
@@ -121,7 +128,8 @@ def place_order(symbol, side, quantity):
         params["sign"] = lbank_sign(params)
         r = requests.post(
             f"{LBANK_BASE}/v2/create_order.do",
-            data=params, timeout=10
+            data=params,
+            timeout=10
         )
         return r.json()
     except Exception as e:
@@ -133,6 +141,10 @@ def calc_qty(symbol, usdt_amount):
         return 0.0
     return round(usdt_amount / price, 0)
 
+
+# ================================================================
+# CLAUDE ESS ANALYSIS
+# ================================================================
 def ask_claude(alert_data):
     headers = {
         "x-api-key":         api_key,
@@ -182,25 +194,49 @@ def parse_setup_type(analysis):
                 return "A"
     return "NONE"
 
+
+# ================================================================
+# TELEGRAM -- plain text only, no Markdown formatting
+# ================================================================
 def send_telegram(message):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat  = os.environ.get("TELEGRAM_CHAT_ID",   "")
+
     if not token or not chat:
+        print("Telegram: missing token or chat ID in environment variables")
         return
+
     try:
-        requests.post(
+        # Remove any characters that could break Telegram delivery
+        clean = (message
+                 .replace("`", "'")
+                 .replace("*", "")
+                 .replace("_", " ")
+                 .replace("[", "(")
+                 .replace("]", ")")
+                 .replace("#", ""))
+
+        r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={
-                "chat_id":    chat,
-                "text":       message,
-                "parse_mode": "Markdown"
+                "chat_id": chat,
+                "text":    clean
             },
             timeout=10
         )
+        result = r.json()
+        if not result.get("ok"):
+            print(f"Telegram failed: {result}")
+        else:
+            print("Telegram sent OK")
+
     except Exception as e:
         print(f"Telegram error: {e}")
 
 
+# ================================================================
+# ROUTES
+# ================================================================
 @app.route("/")
 def home():
     return "ESS FLOKI 8X -- Claude + LBank Active", 200
@@ -214,22 +250,29 @@ def webhook():
         signal     = data.get("signal", "Unknown")
         price      = data.get("close",  "N/A")
 
-        print(f"Alert: {signal} on {ticker} @ {price}")
+        print(f"--------------------------------------------------")
+        print(f"Alert received: {signal} on {ticker} @ {price}")
 
+        # Step 1: Ask Claude to evaluate against ESS rules
         analysis   = ask_claude(data)
         action     = parse_action(analysis)
         setup_type = parse_setup_type(analysis)
 
-        print(f"Action: {action} | Setup: {setup_type}")
+        print(f"Claude action: {action}")
+        print(f"Setup type:    {setup_type}")
+        print(f"Analysis:\n{analysis}")
 
+        # Step 2: Execute only if Claude says ENTER NOW
         order_msg = ""
+
         if action == "ENTER NOW" and setup_type in ("A", "A+") and LBANK_API_KEY:
             symbol    = "floki_usdt"
             usdt_size = TRADE_SIZE_AP if setup_type == "A+" else TRADE_SIZE_A
             balance   = get_balance("usdt")
 
             if balance < usdt_size:
-                order_msg = f"Low balance: {balance:.2f} USDT (need {usdt_size})"
+                order_msg = f"Insufficient balance: {balance:.2f} USDT (need {usdt_size})"
+                print(order_msg)
             else:
                 qty = calc_qty(symbol, usdt_size)
                 if qty > 0:
@@ -238,37 +281,55 @@ def webhook():
                         oid = result.get("data", {}).get("orderId", "N/A")
                         order_msg = (
                             f"ORDER PLACED -- {setup_type}\n"
-                            f"{usdt_size} USDT | {qty} FLOKI | ID: {oid}"
+                            f"{usdt_size} USDT | {qty} FLOKI | Order ID: {oid}"
                         )
                     else:
                         order_msg = f"Order FAILED: {json.dumps(result)}"
+                    print(order_msg)
+                else:
+                    order_msg = "Could not calculate FLOKI quantity"
 
         elif action == "ENTER NOW" and not LBANK_API_KEY:
-            order_msg = "LBank keys not set -- analysis only"
+            order_msg = "LBank keys not configured -- analysis only mode"
 
-        icon  = "\U0001f7e2" if setup_type == "A+" else "\U0001f7e1" if setup_type == "A" else "\U0001f534"
-        tg    = (
-            f"{icon} *ESS {signal} -- {ticker}*\n"
-            f"Price: `{price}`\n\n{analysis}"
+        # Step 3: Build plain text Telegram message
+        if setup_type == "A+":
+            badge = "[ESS A+]"
+        elif setup_type == "A":
+            badge = "[ESS A]"
+        else:
+            badge = "[ESS]"
+
+        tg_message = (
+            f"{badge} {signal} -- {ticker}\n"
+            f"Price: {price}\n"
+            f"Action: {action}\n"
+            f"--------------------------------------------------\n"
+            f"{analysis}"
         )
-        if order_msg:
-            tg += f"\n\n`{order_msg}`"
 
-        send_telegram(tg)
+        if order_msg:
+            tg_message += f"\n--------------------------------------------------\n{order_msg}"
+
+        send_telegram(tg_message)
 
         return json.dumps({
             "status":     "ok",
             "action":     action,
             "setup_type": setup_type,
-            "order":      order_msg or "no order"
+            "order":      order_msg or "no order placed"
         }), 200
 
     except Exception as e:
-        print(f"Error: {e}")
-        send_telegram(f"Webhook error: {str(e)}")
+        error_msg = f"Webhook error: {str(e)}"
+        print(error_msg)
+        send_telegram(f"ERROR: {str(e)}")
         return json.dumps({"status": "error", "message": str(e)}), 500
 
 
+# ================================================================
+# START
+# ================================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
