@@ -13,8 +13,8 @@ LBANK_API_KEY    = os.environ.get("LBANK_API_KEY",    "")
 LBANK_SECRET_KEY = os.environ.get("LBANK_SECRET_KEY", "")
 LBANK_BASE       = "https://api.lbkex.com"
 
-TRADE_SIZE_A     = 10.0
-TRADE_SIZE_AP    = 20.0
+TRADE_SIZE_A     = 00.0
+TRADE_SIZE_AP    = 00.0
 
 # ================================================================
 # ESS FLOKI 8X SYSTEM PROMPT
