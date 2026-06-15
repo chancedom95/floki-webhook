@@ -13,8 +13,8 @@ LBANK_API_KEY    = os.environ.get("LBANK_API_KEY",    "")
 LBANK_SECRET_KEY = os.environ.get("LBANK_SECRET_KEY", "")
 LBANK_BASE       = "https://api.lbkex.com"
 
-TRADE_SIZE_A     = 05.0
-TRADE_SIZE_AP    = 10.0
+TRADE_SIZE_A     = 10.0
+TRADE_SIZE_AP    = 20.0
 
 # ================================================================
 # POSITION TRACKER
@@ -56,20 +56,31 @@ IF ANY STEP IS MISSING: output STATUS = WAITING. DO NOT trigger entry.
 
 SETUP TYPES:
 Setup A:  BTC stabilizing. Partial position 25-50%. Min R:R 1:3.
-Setup A+: BTC confirmed recovery + expanding momentum + strong reclaim.
-          Full position. Min R:R 1:4. Preferred 1:6 to 1:8+.
+          Valid in ALL sessions including Asia and off-hours.
+Setup A+: BTC confirmed recovery + expanding momentum. Full position.
+          Min R:R 1:4. Preferred 1:6 to 1:8+.
+          Valid in ALL active sessions (Asia, London, NY, Overlap).
+          Off-hours only qualifies as Setup A regardless of conditions.
+
+SESSION QUALITY ASSESSMENT (factor into analysis, not a blocker):
+- London/NY Overlap (13:00-16:00 UTC): Highest liquidity. Best execution.
+- London (07:00-16:00 UTC): High liquidity. Strong for entries.
+- New York (12:00-21:00 UTC): High liquidity. Strong for entries.
+- Asia (00:00-08:00 UTC): Valid session. Lower liquidity but genuine
+  setups occur. Require BTC to be clearly confirming -- no ambiguity.
+- Off-hours: Lower quality. Cap at Setup A. Reduce position size.
 
 NO TRADE CONDITIONS (output STATUS = NO TRADE if ANY apply):
 - No BTC confirmation
 - No reclaim confirmed
 - No retest held
-- R:R below minimum
+- R:R below minimum for setup type
 - BTC aggressively selling
-- Price far extended from entry
+- Price far extended from planned entry zone
 - FOMO or chasing entries
 
 TRADE MANAGEMENT:
-- TP1: Take 30% -- move SL to breakeven IMMEDIATELY after TP1
+- TP1: Take 30% -- move SL to breakeven IMMEDIATELY
 - TP2: Take 40%
 - TP3: Remaining position
 
@@ -88,7 +99,7 @@ TP2 (40%): [exact price or Not set]
 TP3 (rem): [exact price or Not set]
 R:R: [ratio or N/A]
 
-Session: [London / NY / Off-hours]
+Session: [session name and quality assessment]
 Action: [ENTER NOW / WAIT / NO TRADE]"""
 
 
@@ -160,6 +171,27 @@ def calc_qty(symbol, usdt_amount):
     return round(usdt_amount / price, 0)
 
 
+def get_current_session():
+    """Determine actual trading session from UTC time -- more reliable than alert message value"""
+    import datetime
+    h = datetime.datetime.utcnow().hour
+
+    asia_act   = 0 <= h < 8
+    london_act = 7 <= h < 16
+    ny_act     = 12 <= h < 21
+    overlap    = london_act and ny_act
+
+    if overlap:
+        return "London/NY Overlap (13:00-16:00 UTC) -- Best liquidity"
+    elif london_act:
+        return "London (07:00-16:00 UTC) -- High liquidity"
+    elif ny_act:
+        return "New York (12:00-21:00 UTC) -- High liquidity"
+    elif asia_act:
+        return "Asia (00:00-08:00 UTC) -- Valid session, lower liquidity"
+    else:
+        return "Off-Hours -- Lower quality, Setup A only"
+
 # ================================================================
 # CLAUDE
 # ================================================================
@@ -169,6 +201,8 @@ def ask_claude(alert_data):
         "anthropic-version": "2023-06-01",
         "content-type":      "application/json",
     }
+    # Session determined server-side from actual UTC time for accuracy
+    session = get_current_session()
     user_msg = (
         f"ESS Alert for {alert_data.get('ticker', 'FLOKI')}:\n"
         f"Price: {alert_data.get('close')}\n"
@@ -177,7 +211,7 @@ def ask_claude(alert_data):
         f"ESS Step: {alert_data.get('ess_step', 'Not specified')}\n"
         f"BTC Status: {alert_data.get('btc_status', 'Not specified')}\n"
         f"Sequence: {alert_data.get('sequence', 'Not specified')}\n"
-        f"Session: {alert_data.get('session', 'Not specified')}\n\n"
+        f"Session: {session}\n\n"
         f"Evaluate against ESS FLOKI 8X rules. If full 5-step "
         f"sequence is not confirmed output STATUS = WAITING."
     )
