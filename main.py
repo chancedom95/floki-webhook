@@ -17,7 +17,27 @@ TRADE_SIZE_A     = 05.0
 TRADE_SIZE_AP    = 10.0
 
 # ================================================================
-# ESS FLOKI 8X SYSTEM PROMPT
+# POSITION TRACKER
+# ================================================================
+position = {
+    "active":             False,
+    "symbol":             "floki_usdt",
+    "quantity_original":  0.0,
+    "quantity_remaining": 0.0,
+    "entry_price":        0.0,
+    "sl_price":           0.0,
+    "tp1_price":          0.0,
+    "tp2_price":          0.0,
+    "tp3_price":          0.0,
+    "tp1_hit":            False,
+    "tp2_hit":            False,
+    "tp3_hit":            False,
+    "order_id":           None,
+    "setup_type":         None,
+}
+
+# ================================================================
+# ESS SYSTEM PROMPT
 # ================================================================
 ESS_SYSTEM = """You are the ESS FLOKI 8X Swing Trading System analyst.
 
@@ -73,7 +93,7 @@ Action: [ENTER NOW / WAIT / NO TRADE]"""
 
 
 # ================================================================
-# LBANK FUNCTIONS
+# LBANK
 # ================================================================
 def lbank_sign(params):
     sorted_params = "&".join(
@@ -100,17 +120,16 @@ def get_price(symbol):
         print(f"Price error: {e}")
         return 0.0
 
-def get_balance(asset="usdt"):
+def get_floki_balance():
     try:
         params = {"api_key": LBANK_API_KEY, "timestamp": lbank_ts()}
         params["sign"] = lbank_sign(params)
         r = requests.post(
             f"{LBANK_BASE}/v2/user_info.do",
-            data=params,
-            timeout=10
+            data=params, timeout=10
         )
         funds = r.json().get("data", {}).get("info", {}).get("free", {})
-        return float(funds.get(asset, 0))
+        return float(funds.get("floki", 0))
     except Exception as e:
         print(f"Balance error: {e}")
         return 0.0
@@ -122,14 +141,13 @@ def place_order(symbol, side, quantity):
             "symbol":    symbol,
             "type":      side,
             "price":     "0",
-            "amount":    str(quantity),
+            "amount":    str(round(quantity, 0)),
             "timestamp": lbank_ts(),
         }
         params["sign"] = lbank_sign(params)
         r = requests.post(
             f"{LBANK_BASE}/v2/create_order.do",
-            data=params,
-            timeout=10
+            data=params, timeout=10
         )
         return r.json()
     except Exception as e:
@@ -143,7 +161,7 @@ def calc_qty(symbol, usdt_amount):
 
 
 # ================================================================
-# CLAUDE ESS ANALYSIS
+# CLAUDE
 # ================================================================
 def ask_claude(alert_data):
     headers = {
@@ -160,9 +178,8 @@ def ask_claude(alert_data):
         f"BTC Status: {alert_data.get('btc_status', 'Not specified')}\n"
         f"Sequence: {alert_data.get('sequence', 'Not specified')}\n"
         f"Session: {alert_data.get('session', 'Not specified')}\n\n"
-        f"Evaluate against ESS FLOKI 8X rules. If the full 5-step "
-        f"sequence is not confirmed output STATUS = WAITING and do "
-        f"not trigger an entry."
+        f"Evaluate against ESS FLOKI 8X rules. If full 5-step "
+        f"sequence is not confirmed output STATUS = WAITING."
     )
     body = {
         "model":      "claude-sonnet-4-6",
@@ -170,19 +187,15 @@ def ask_claude(alert_data):
         "system":     ESS_SYSTEM,
         "messages":   [{"role": "user", "content": user_msg}]
     }
-    r = requests.post(
+    r        = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers=headers,
-        json=body,
-        timeout=30
+        headers=headers, json=body, timeout=30
     )
     response = r.json()
-    print(f"Claude raw response: {response}")
-
+    print(f"Claude: {response}")
     if "content" not in response:
-        error_detail = response.get("error", {}).get("message", str(response))
-        raise Exception(f"Claude API error: {error_detail}")
-
+        error = response.get("error", {}).get("message", str(response))
+        raise Exception(f"Claude API error: {error}")
     return response["content"][0]["text"]
 
 def parse_action(analysis):
@@ -195,148 +208,338 @@ def parse_setup_type(analysis):
     for line in analysis.splitlines():
         if "Setup Type:" in line:
             val = line.split(":", 1)[1].strip()
-            if "A+" in val:
-                return "A+"
-            if val == "A":
-                return "A"
+            if "A+" in val: return "A+"
+            if val == "A":  return "A"
     return "NONE"
 
 
 # ================================================================
-# TELEGRAM -- plain text only, no Markdown formatting
+# TELEGRAM
 # ================================================================
 def send_telegram(message):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat  = os.environ.get("TELEGRAM_CHAT_ID",   "")
-
     if not token or not chat:
-        print("Telegram: missing token or chat ID in environment variables")
         return
-
     try:
-        # Remove any characters that could break Telegram delivery
         clean = (message
-                 .replace("`", "'")
-                 .replace("*", "")
-                 .replace("_", " ")
-                 .replace("[", "(")
-                 .replace("]", ")")
-                 .replace("#", ""))
-
+                 .replace("`","'").replace("*","")
+                 .replace("_"," ").replace("[","(")
+                 .replace("]",")").replace("#",""))
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id": chat,
-                "text":    clean
-            },
+            json={"chat_id": chat, "text": clean},
             timeout=10
         )
-        result = r.json()
-        if not result.get("ok"):
-            print(f"Telegram failed: {result}")
+        if not r.json().get("ok"):
+            print(f"Telegram failed: {r.json()}")
         else:
             print("Telegram sent OK")
-
     except Exception as e:
         print(f"Telegram error: {e}")
 
 
 # ================================================================
-# ROUTES
+# TRADE HANDLERS
+# ================================================================
+def handle_entry(data, analysis, setup_type):
+    global position
+    if position["active"]:
+        return "Entry skipped -- position already active"
+    if not LBANK_API_KEY:
+        return "LBank keys not set -- analysis only"
+
+    symbol    = "floki_usdt"
+    usdt_size = TRADE_SIZE_AP if setup_type == "A+" else TRADE_SIZE_A
+    qty       = calc_qty(symbol, usdt_size)
+    if qty <= 0:
+        return "Could not calculate quantity"
+
+    result = place_order(symbol, "buy", qty)
+    print(f"Entry result: {result}")
+
+    if result.get("result") == "true":
+        oid   = result.get("data", {}).get("orderId", "N/A")
+        price = float(data.get("close", 0))
+        position.update({
+            "active":             True,
+            "symbol":             symbol,
+            "quantity_original":  qty,
+            "quantity_remaining": qty,
+            "entry_price":        price,
+            "tp1_hit":            False,
+            "tp2_hit":            False,
+            "tp3_hit":            False,
+            "order_id":           oid,
+            "setup_type":         setup_type,
+        })
+        return (
+            f"ENTRY PLACED -- {setup_type}\n"
+            f"Bought: {qty} FLOKI\n"
+            f"Price: {price}\n"
+            f"Size: {usdt_size} USDT\n"
+            f"Order ID: {oid}\n"
+            f"System will auto-execute TP1 30% / TP2 40% / TP3 rem\n"
+            f"SL moves to breakeven automatically after TP1"
+        )
+    else:
+        return f"Entry FAILED: {json.dumps(result)}"
+
+
+def handle_tp1(data):
+    global position
+    if not position["active"]:
+        return "TP1 skipped -- no active position"
+    if position["tp1_hit"]:
+        return "TP1 already executed"
+
+    qty_sell = round(position["quantity_original"] * 0.30, 0)
+    if qty_sell <= 0:
+        return "TP1 quantity too small"
+
+    result = place_order(position["symbol"], "sell", qty_sell)
+    print(f"TP1 result: {result}")
+
+    if result.get("result") == "true":
+        oid = result.get("data", {}).get("orderId", "N/A")
+        position["tp1_hit"]            = True
+        position["quantity_remaining"] -= qty_sell
+        position["sl_price"]           = position["entry_price"]
+        return (
+            f"TP1 EXECUTED -- 30% CLOSED\n"
+            f"Sold: {qty_sell} FLOKI\n"
+            f"Remaining: {position['quantity_remaining']} FLOKI\n"
+            f"Order ID: {oid}\n"
+            f"SL moved to breakeven: {position['entry_price']}\n"
+            f"Holding for TP2..."
+        )
+    else:
+        return f"TP1 FAILED: {json.dumps(result)} -- CLOSE 30% MANUALLY NOW"
+
+
+def handle_tp2(data):
+    global position
+    if not position["active"]:
+        return "TP2 skipped -- no active position"
+    if not position["tp1_hit"]:
+        return "TP2 skipped -- TP1 not hit yet"
+    if position["tp2_hit"]:
+        return "TP2 already executed"
+
+    qty_sell = round(position["quantity_original"] * 0.40, 0)
+    qty_sell = min(qty_sell, position["quantity_remaining"])
+    if qty_sell <= 0:
+        return "TP2 quantity too small"
+
+    result = place_order(position["symbol"], "sell", qty_sell)
+    print(f"TP2 result: {result}")
+
+    if result.get("result") == "true":
+        oid = result.get("data", {}).get("orderId", "N/A")
+        position["tp2_hit"]            = True
+        position["quantity_remaining"] -= qty_sell
+        return (
+            f"TP2 EXECUTED -- 40% CLOSED\n"
+            f"Sold: {qty_sell} FLOKI\n"
+            f"Remaining: {position['quantity_remaining']} FLOKI\n"
+            f"Order ID: {oid}\n"
+            f"Holding remainder for TP3..."
+        )
+    else:
+        return f"TP2 FAILED: {json.dumps(result)} -- CLOSE 40% MANUALLY NOW"
+
+
+def handle_tp3(data):
+    global position
+    if not position["active"]:
+        return "TP3 skipped -- no active position"
+    if not position["tp2_hit"]:
+        return "TP3 skipped -- TP2 not hit yet"
+    if position["tp3_hit"]:
+        return "TP3 already executed"
+
+    actual = get_floki_balance()
+    qty_sell = round(actual if actual > 0 else position["quantity_remaining"], 0)
+    if qty_sell <= 0:
+        position["active"] = False
+        return "TP3: no FLOKI remaining -- already closed"
+
+    result = place_order(position["symbol"], "sell", qty_sell)
+    print(f"TP3 result: {result}")
+
+    if result.get("result") == "true":
+        oid = result.get("data", {}).get("orderId", "N/A")
+        position.update({
+            "tp3_hit": True,
+            "quantity_remaining": 0,
+            "active": False
+        })
+        return (
+            f"TP3 EXECUTED -- TRADE COMPLETE\n"
+            f"Sold: {qty_sell} FLOKI\n"
+            f"Order ID: {oid}\n"
+            f"Full ESS sequence completed\n"
+            f"Position closed. Ready for next setup."
+        )
+    else:
+        return f"TP3 FAILED: {json.dumps(result)} -- CLOSE REMAINING MANUALLY NOW"
+
+
+def handle_sl(data):
+    global position
+    if not position["active"]:
+        return "SL alert -- no active position"
+
+    actual = get_floki_balance()
+    qty_sell = round(actual if actual > 0 else position["quantity_remaining"], 0)
+    if qty_sell <= 0:
+        position["active"] = False
+        return "SL: already closed"
+
+    result = place_order(position["symbol"], "sell", qty_sell)
+    print(f"SL result: {result}")
+
+    if result.get("result") == "true":
+        oid = result.get("data", {}).get("orderId", "N/A")
+        was_be = position["tp1_hit"]
+        position.update({"active": False, "quantity_remaining": 0})
+        return (
+            f"STOP LOSS EXECUTED\n"
+            f"Sold: {qty_sell} FLOKI\n"
+            f"Order ID: {oid}\n"
+            f"{'SL was at breakeven -- protected' if was_be else 'Loss taken per ESS rules'}\n"
+            f"Position closed."
+        )
+    else:
+        return f"SL FAILED: {json.dumps(result)} -- CLOSE MANUALLY ON LBANK NOW"
+
+
+def handle_invalidated(data):
+    global position
+    if not position["active"]:
+        return "BTC invalidation -- no active position"
+
+    actual = get_floki_balance()
+    qty_sell = round(actual if actual > 0 else position["quantity_remaining"], 0)
+    if qty_sell <= 0:
+        position["active"] = False
+        return "Invalidated: nothing to close"
+
+    result = place_order(position["symbol"], "sell", qty_sell)
+    if result.get("result") == "true":
+        position.update({"active": False, "quantity_remaining": 0})
+        return (
+            f"BTC INVALIDATION -- POSITION CLOSED\n"
+            f"Sold: {qty_sell} FLOKI\n"
+            f"BTC lost key support\n"
+            f"Position cleared per ESS rules."
+        )
+    else:
+        return f"Invalidation close FAILED -- CLOSE MANUALLY ON LBANK NOW"
+
+
+# ================================================================
+# WEBHOOK
 # ================================================================
 @app.route("/")
 def home():
-    return "ESS FLOKI 8X -- Claude + LBank Active", 200
+    status = "ACTIVE" if position["active"] else "IDLE"
+    return f"ESS FLOKI 8X -- Claude + LBank | Position: {status}", 200
+
+
+@app.route("/status")
+def pos_status():
+    return json.dumps(position, indent=2), 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data       = request.json or {}
-        ticker     = data.get("ticker", "FLOKIUSDT")
-        signal     = data.get("signal", "Unknown")
-        price      = data.get("close",  "N/A")
+        data   = request.json or {}
+        ticker = data.get("ticker", "FLOKIUSDT")
+        signal = data.get("signal", "Unknown")
+        price  = data.get("close",  "N/A")
 
-        print(f"--------------------------------------------------")
-        print(f"Alert received: {signal} on {ticker} @ {price}")
+        print(f"\n{'='*50}\nSignal: {signal} | {ticker} @ {price}")
+        print(f"Position: {position['active']} | Held: {position['quantity_remaining']}")
 
-        # Step 1: Ask Claude to evaluate against ESS rules
-        analysis   = ask_claude(data)
-        action     = parse_action(analysis)
-        setup_type = parse_setup_type(analysis)
+        result_msg = ""
+        analysis   = ""
+        action     = ""
+        setup_type = ""
 
-        print(f"Claude action: {action}")
-        print(f"Setup type:    {setup_type}")
-        print(f"Analysis:\n{analysis}")
-
-        # Step 2: Execute only if Claude says ENTER NOW
-        order_msg = ""
-
-        if action == "ENTER NOW" and setup_type in ("A", "A+") and LBANK_API_KEY:
-            symbol    = "floki_usdt"
-            usdt_size = TRADE_SIZE_AP if setup_type == "A+" else TRADE_SIZE_A
-            balance   = get_balance("usdt")
-
-            if balance < usdt_size:
-                order_msg = f"Insufficient balance: {balance:.2f} USDT (need {usdt_size})"
-                print(order_msg)
+        # Route by signal
+        if signal in ("ESS A+ SETUP", "ESS A SETUP"):
+            analysis   = ask_claude(data)
+            action     = parse_action(analysis)
+            setup_type = parse_setup_type(analysis)
+            if action == "ENTER NOW" and setup_type in ("A", "A+"):
+                result_msg = handle_entry(data, analysis, setup_type)
             else:
-                qty = calc_qty(symbol, usdt_size)
-                if qty > 0:
-                    result = place_order(symbol, "buy", qty)
-                    if result.get("result") == "true":
-                        oid = result.get("data", {}).get("orderId", "N/A")
-                        order_msg = (
-                            f"ORDER PLACED -- {setup_type}\n"
-                            f"{usdt_size} USDT | {qty} FLOKI | Order ID: {oid}"
-                        )
-                    else:
-                        order_msg = f"Order FAILED: {json.dumps(result)}"
-                    print(order_msg)
-                else:
-                    order_msg = "Could not calculate FLOKI quantity"
+                result_msg = f"Claude: {action} -- no order"
 
-        elif action == "ENTER NOW" and not LBANK_API_KEY:
-            order_msg = "LBank keys not configured -- analysis only mode"
+        elif signal == "ESS TP1 HIT":
+            result_msg = handle_tp1(data)
 
-        # Step 3: Build plain text Telegram message
-        if setup_type == "A+":
-            badge = "[ESS A+]"
-        elif setup_type == "A":
-            badge = "[ESS A]"
+        elif signal == "ESS TP2 HIT":
+            result_msg = handle_tp2(data)
+
+        elif signal == "ESS TP3 HIT":
+            result_msg = handle_tp3(data)
+
+        elif signal == "ESS STOP LOSS HIT":
+            result_msg = handle_sl(data)
+
+        elif signal == "ESS INVALIDATED":
+            result_msg = handle_invalidated(data)
+
+        elif signal in ("ESS SWEEP DETECTED", "ESS RECLAIM CONFIRMED", "ESS RETEST HOLD"):
+            steps = {
+                "ESS SWEEP DETECTED":    "Step 1 done -- sweep confirmed. Watching for reclaim.",
+                "ESS RECLAIM CONFIRMED": "Step 2 done -- reclaim confirmed. Watching for retest.",
+                "ESS RETEST HOLD":       "Step 3 done -- retest held. Watching for BTC + trigger.",
+            }
+            result_msg = steps.get(signal, signal)
+
         else:
-            badge = "[ESS]"
+            result_msg = f"Signal received: {signal}"
 
-        tg_message = (
-            f"{badge} {signal} -- {ticker}\n"
-            f"Price: {price}\n"
-            f"Action: {action}\n"
-            f"--------------------------------------------------\n"
-            f"{analysis}"
-        )
+        # Build Telegram message
+        badges = {
+            "ESS A+ SETUP": "(A+)", "ESS A SETUP": "(A)",
+            "ESS TP1 HIT": "(TP1)", "ESS TP2 HIT": "(TP2)",
+            "ESS TP3 HIT": "(TP3)", "ESS STOP LOSS HIT": "(SL)",
+            "ESS INVALIDATED": "(INV)", "ESS SWEEP DETECTED": "(SW)",
+            "ESS RECLAIM CONFIRMED": "(RC)", "ESS RETEST HOLD": "(RT)",
+        }
+        badge = badges.get(signal, "(i)")
+        tg    = f"{badge} {ticker} @ {price}\n{signal}\n\n"
+        if analysis:
+            tg += f"{analysis}\n\n"
+        tg += result_msg
 
-        if order_msg:
-            tg_message += f"\n--------------------------------------------------\n{order_msg}"
+        if position["active"]:
+            tg += (
+                f"\n\nPosition: {position['quantity_remaining']} FLOKI held"
+                f"\nTP1: {'Done' if position['tp1_hit'] else 'Pending'}"
+                f" | TP2: {'Done' if position['tp2_hit'] else 'Pending'}"
+                f" | TP3: Pending"
+            )
 
-        send_telegram(tg_message)
+        send_telegram(tg)
 
         return json.dumps({
-            "status":     "ok",
-            "action":     action,
-            "setup_type": setup_type,
-            "order":      order_msg or "no order placed"
+            "status": "ok", "signal": signal,
+            "action": action or "routed", "result": result_msg
         }), 200
 
     except Exception as e:
-        error_msg = f"Webhook error: {str(e)}"
-        print(error_msg)
+        print(f"Error: {e}")
         send_telegram(f"ERROR: {str(e)}")
         return json.dumps({"status": "error", "message": str(e)}), 500
 
 
-# ================================================================
-# START
-# ================================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    print(f"ESS FLOKI 8X starting on port {port}")
     app.run(host="0.0.0.0", port=port)
