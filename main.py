@@ -150,7 +150,7 @@ def lbank_headers():
     return {
         "Content-Type":     "application/x-www-form-urlencoded",
         "timestamp":         lbank_ts(),
-        "signature_method": "hmacsha56",
+        "signature_method": "hmacsha256",
         "echostr":           lbank_echostr(),
     }
 
