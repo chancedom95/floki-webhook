@@ -3,6 +3,8 @@ import json
 import hmac
 import hashlib
 import time
+import random
+import string
 import requests
 from flask import Flask, request
 
@@ -15,6 +17,13 @@ LBANK_BASE       = "https://api.lbkex.com"
 
 TRADE_SIZE_A     = 10.0
 TRADE_SIZE_AP    = 20.0
+
+# Quick-scalp time management: if TP1 hasn't hit within this window,
+# close out regardless of P&L -- the setup isn't working as intended.
+# Once TP1 hits (SL already at breakeven), give it more room before
+# the backstop forces a close, since there's no real risk left.
+MAX_HOLD_PRE_TP1_MIN  = 60
+MAX_HOLD_POST_TP1_MIN = 180
 
 # ================================================================
 # POSITION TRACKER
@@ -34,72 +43,79 @@ position = {
     "tp3_hit":            False,
     "order_id":           None,
     "setup_type":         None,
+    "entry_time":         None,
 }
 
 # ================================================================
-# ESS SYSTEM PROMPT
+# ESS SYSTEM PROMPT -- QUICK-SCALP EDITION
+# Pine now sends the EXACT entry/SL/TP numbers it calculated, so
+# Claude's job is to validate and report, not estimate fresh prices.
 # ================================================================
-ESS_SYSTEM = """You are the ESS FLOKI 8X Swing Trading System analyst.
+ESS_SYSTEM = """You are the ESS FLOKI 8X Quick-Scalp analyst.
 
 CORE RULE: BTC determines market direction. FLOKI is ONLY traded LONG
 when BTC supports the setup. NO SHORTS. NO counter-trend. NO chasing.
 NO FOMO entries.
 
-REQUIRED 5-STEP SEQUENCE (all must be confirmed):
-1. Liquidity Sweep -- wick through key level, body closes back inside
-2. Reclaim -- price closes back above the swept level
-3. Retest Hold -- price returns to reclaimed level and holds above it
-4. BTC Confirmation -- BTC holding support, not aggressively selling
-5. Entry Trigger -- bullish confirmation candle on 15M timeframe
+THIS IS A QUICK-SCALP SYSTEM, NOT A SWING SYSTEM.
+Target hold time is minutes to roughly one hour. Trades that don't
+reach TP1 within that window get closed by the automation regardless
+of P&L -- the setup either works quickly or it gets cut.
 
-IF ANY STEP IS MISSING: output STATUS = WAITING. DO NOT trigger entry.
+REQUIRED 5-STEP SEQUENCE (all must be confirmed, all already verified
+by the indicator before this alert ever fired):
+1. Liquidity Sweep -- wick through key level, body closes back inside
+2. Reclaim -- price closes back above the swept level, quickly
+3. Retest Hold -- price returns to reclaimed level and holds, quickly
+4. BTC Confirmation -- BOTH the 4H structural filter AND the fast
+   same-timeframe BTC pulse must be aligned (provided as btc_pulse)
+5. Entry Trigger -- a real-bodied confirmation candle, not extended
+   too far from the reclaim zone, with RSI not already overbought
+
+THE ALERT DATA INCLUDES THE EXACT ENTRY/SL/TP1/TP2/TP3 PRICES THE
+INDICATOR CALCULATED. USE THOSE EXACT NUMBERS IN YOUR RESPONSE.
+DO NOT INVENT OR RE-ESTIMATE DIFFERENT PRICE LEVELS.
 
 SETUP TYPES:
-Setup A:  BTC stabilizing. Partial position 25-50%. Min R:R 1:3.
-          Valid in ALL sessions including Asia and off-hours.
-Setup A+: BTC confirmed recovery + expanding momentum. Full position.
-          Min R:R 1:4. Preferred 1:6 to 1:8+.
-          Valid in ALL active sessions (Asia, London, NY, Overlap).
-          Off-hours only qualifies as Setup A regardless of conditions.
-
-SESSION QUALITY ASSESSMENT (factor into analysis, not a blocker):
-- London/NY Overlap (13:00-16:00 UTC): Highest liquidity. Best execution.
-- London (07:00-16:00 UTC): High liquidity. Strong for entries.
-- New York (12:00-21:00 UTC): High liquidity. Strong for entries.
-- Asia (00:00-08:00 UTC): Valid session. Lower liquidity but genuine
-  setups occur. Require BTC to be clearly confirming -- no ambiguity.
-- Off-hours: Lower quality. Cap at Setup A. Reduce position size.
+Setup A:  BTC stabilizing. Partial position. Min R:R 1:1.2.
+Setup A+: BTC 4H recovery + fast pulse confirmed + momentum expanding.
+          Full position. Min R:R 1:1.5.
+These R:R minimums are intentionally tight -- this system favors a
+high hit-rate on fast, achievable targets over rare large R:R swings.
 
 NO TRADE CONDITIONS (output STATUS = NO TRADE if ANY apply):
-- No BTC confirmation
+- btc_pulse is WEAK (fast BTC momentum not aligned, even if 4H is fine)
 - No reclaim confirmed
 - No retest held
-- R:R below minimum for setup type
+- R:R below the minimum for the setup type
 - BTC aggressively selling
-- Price far extended from planned entry zone
+- Price far extended from the entry zone
 - FOMO or chasing entries
 
 TRADE MANAGEMENT:
 - TP1: Take 30% -- move SL to breakeven IMMEDIATELY
 - TP2: Take 40%
 - TP3: Remaining position
+- Time exit: if TP1 not reached within the automation's hold window,
+  the position is closed automatically. This is expected behavior,
+  not a failure of the system -- it is the system working as designed.
 
 RESPONSE FORMAT (use exactly this, no changes):
 
 ESS FLOKI 8X SETUP
 Setup Type: [A / A+ / NONE]
 Status: [WAITING / TRIGGERED / NO TRADE]
-BTC Filter: [GO / NO GO -- one sentence]
+BTC Filter: [GO / NO GO -- mention both 4H structure and pulse]
 Sequence: [which of the 5 steps are confirmed]
 
-ENTRY: [exact price or Not triggered]
-STOP LOSS: [exact price or Not set]
-TP1 (30%): [exact price or Not set]
-TP2 (40%): [exact price or Not set]
-TP3 (rem): [exact price or Not set]
+ENTRY: [exact price from alert data, or Not triggered]
+STOP LOSS: [exact price from alert data, or Not set]
+TP1 (30%): [exact price from alert data, or Not set]
+TP2 (40%): [exact price from alert data, or Not set]
+TP3 (rem): [exact price from alert data, or Not set]
 R:R: [ratio or N/A]
 
-Session: [session name and quality assessment]
+Session: [session name from alert data]
 Action: [ENTER NOW / WAIT / NO TRADE]"""
 
 
@@ -111,7 +127,6 @@ Action: [ENTER NOW / WAIT / NO TRADE]"""
 #   3. HMAC-SHA256 sign preparedStr with the secret key -> sign
 # Every signed request also needs THREE auth headers (separate from
 # the signed params): timestamp, signature_method, echostr.
-# Missing any of these produces error_code 10202 ("...can not be null").
 # ================================================================
 def lbank_sign(params):
     sorted_params = "&".join(
@@ -128,14 +143,10 @@ def lbank_ts():
     return str(int(time.time() * 1000))
 
 def lbank_echostr():
-    """LBank requires a random alphanumeric string, length 30-40, per request"""
-    import random
-    import string
     length = random.randint(30, 40)
     return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
 
 def lbank_headers():
-    """Required auth headers for every signed LBank request"""
     return {
         "Content-Type":     "application/x-www-form-urlencoded",
         "timestamp":         lbank_ts(),
@@ -198,27 +209,6 @@ def calc_qty(symbol, usdt_amount):
     return round(usdt_amount / price, 0)
 
 
-def get_current_session():
-    """Determine actual trading session from UTC time -- more reliable than alert message value"""
-    import datetime
-    h = datetime.datetime.utcnow().hour
-
-    asia_act   = 0 <= h < 8
-    london_act = 7 <= h < 16
-    ny_act     = 12 <= h < 21
-    overlap    = london_act and ny_act
-
-    if overlap:
-        return "London/NY Overlap (13:00-16:00 UTC) -- Best liquidity"
-    elif london_act:
-        return "London (07:00-16:00 UTC) -- High liquidity"
-    elif ny_act:
-        return "New York (12:00-21:00 UTC) -- High liquidity"
-    elif asia_act:
-        return "Asia (00:00-08:00 UTC) -- Valid session, lower liquidity"
-    else:
-        return "Off-Hours -- Lower quality, Setup A only"
-
 # ================================================================
 # CLAUDE
 # ================================================================
@@ -228,19 +218,20 @@ def ask_claude(alert_data):
         "anthropic-version": "2023-06-01",
         "content-type":      "application/json",
     }
-    # Session determined server-side from actual UTC time for accuracy
-    session = get_current_session()
     user_msg = (
         f"ESS Alert for {alert_data.get('ticker', 'FLOKI')}:\n"
-        f"Price: {alert_data.get('close')}\n"
         f"Signal: {alert_data.get('signal')}\n"
-        f"Timeframe: {alert_data.get('timeframe')}m\n"
-        f"ESS Step: {alert_data.get('ess_step', 'Not specified')}\n"
-        f"BTC Status: {alert_data.get('btc_status', 'Not specified')}\n"
-        f"Sequence: {alert_data.get('sequence', 'Not specified')}\n"
-        f"Session: {session}\n\n"
-        f"Evaluate against ESS FLOKI 8X rules. If full 5-step "
-        f"sequence is not confirmed output STATUS = WAITING."
+        f"Close: {alert_data.get('close')}\n"
+        f"Entry (from indicator): {alert_data.get('entry', 'n/a')}\n"
+        f"Stop Loss (from indicator): {alert_data.get('sl', 'n/a')}\n"
+        f"TP1 (from indicator): {alert_data.get('tp1', 'n/a')}\n"
+        f"TP2 (from indicator): {alert_data.get('tp2', 'n/a')}\n"
+        f"TP3 (from indicator): {alert_data.get('tp3', 'n/a')}\n"
+        f"Timeframe: {alert_data.get('timeframe', 'n/a')}m\n"
+        f"BTC Pulse: {alert_data.get('btc_pulse', 'n/a')}\n"
+        f"Session: {alert_data.get('session', 'n/a')}\n\n"
+        f"Evaluate this against the ESS Quick-Scalp rules. Use the "
+        f"exact entry/SL/TP numbers provided above in your response."
     )
     body = {
         "model":      "claude-sonnet-4-6",
@@ -320,28 +311,39 @@ def handle_entry(data, analysis, setup_type):
     print(f"Entry result: {result}")
 
     if result.get("result") == "true":
-        oid   = result.get("data", {}).get("orderId", "N/A")
-        price = float(data.get("close", 0))
+        oid = result.get("data", {}).get("orderId", "N/A")
+        try:
+            price = float(data.get("entry", data.get("close", 0)))
+            sl    = float(data.get("sl",  0))
+            tp1   = float(data.get("tp1", 0))
+            tp2   = float(data.get("tp2", 0))
+            tp3   = float(data.get("tp3", 0))
+        except (TypeError, ValueError):
+            price, sl, tp1, tp2, tp3 = float(data.get("close", 0)), 0.0, 0.0, 0.0, 0.0
+
         position.update({
             "active":             True,
             "symbol":             symbol,
             "quantity_original":  qty,
             "quantity_remaining": qty,
             "entry_price":        price,
+            "sl_price":           sl,
+            "tp1_price":          tp1,
+            "tp2_price":          tp2,
+            "tp3_price":          tp3,
             "tp1_hit":            False,
             "tp2_hit":            False,
             "tp3_hit":            False,
             "order_id":           oid,
             "setup_type":         setup_type,
+            "entry_time":         time.time(),
         })
         return (
             f"ENTRY PLACED -- {setup_type}\n"
-            f"Bought: {qty} FLOKI\n"
-            f"Price: {price}\n"
-            f"Size: {usdt_size} USDT\n"
-            f"Order ID: {oid}\n"
-            f"System will auto-execute TP1 30% / TP2 40% / TP3 rem\n"
-            f"SL moves to breakeven automatically after TP1"
+            f"Bought: {qty} FLOKI @ {price}\n"
+            f"SL: {sl}  TP1: {tp1}  TP2: {tp2}  TP3: {tp3}\n"
+            f"Size: {usdt_size} USDT | Order ID: {oid}\n"
+            f"Quick-scalp window: ~{MAX_HOLD_PRE_TP1_MIN} min to reach TP1"
         )
     else:
         return f"Entry FAILED: {json.dumps(result)}"
@@ -372,7 +374,7 @@ def handle_tp1(data):
             f"Remaining: {position['quantity_remaining']} FLOKI\n"
             f"Order ID: {oid}\n"
             f"SL moved to breakeven: {position['entry_price']}\n"
-            f"Holding for TP2..."
+            f"Holding for TP2 (up to {MAX_HOLD_POST_TP1_MIN} min backstop)..."
         )
     else:
         return f"TP1 FAILED: {json.dumps(result)} -- CLOSE 30% MANUALLY NOW"
@@ -439,8 +441,7 @@ def handle_tp3(data):
             f"TP3 EXECUTED -- TRADE COMPLETE\n"
             f"Sold: {qty_sell} FLOKI\n"
             f"Order ID: {oid}\n"
-            f"Full ESS sequence completed\n"
-            f"Position closed. Ready for next setup."
+            f"Full sequence completed. Position closed. Ready for next setup."
         )
     else:
         return f"TP3 FAILED: {json.dumps(result)} -- CLOSE REMAINING MANUALLY NOW"
@@ -499,13 +500,67 @@ def handle_invalidated(data):
         return f"Invalidation close FAILED -- CLOSE MANUALLY ON LBANK NOW"
 
 
+def handle_time_exit():
+    """Quick-scalp enforcement: trade has stalled, close it regardless of P&L"""
+    global position
+    if not position["active"]:
+        return "Time exit check -- no active position"
+
+    actual = get_floki_balance()
+    qty_sell = round(actual if actual > 0 else position["quantity_remaining"], 0)
+    if qty_sell <= 0:
+        position["active"] = False
+        return "Time exit: nothing to close"
+
+    result = place_order(position["symbol"], "sell", qty_sell)
+    print(f"Time exit result: {result}")
+
+    if result.get("result") == "true":
+        oid = result.get("data", {}).get("orderId", "N/A")
+        position.update({"active": False, "quantity_remaining": 0})
+        return (
+            f"TIME EXIT -- POSITION CLOSED\n"
+            f"Sold: {qty_sell} FLOKI\n"
+            f"Order ID: {oid}\n"
+            f"Held too long without resolving -- closed per quick-scalp rules"
+        )
+    else:
+        return f"Time exit FAILED: {json.dumps(result)} -- CLOSE MANUALLY ON LBANK NOW"
+
+
+def check_time_stop():
+    """
+    Called on every '/' ping (UptimeRobot already hits this every 5 min,
+    so this needs no new infrastructure). Also triggered instantly via
+    the 'ESS TIME EXIT' webhook signal the Pine script sends.
+    """
+    global position
+    if not position["active"] or not position.get("entry_time"):
+        return None
+
+    elapsed_min = (time.time() - position["entry_time"]) / 60.0
+
+    if not position["tp1_hit"] and elapsed_min >= MAX_HOLD_PRE_TP1_MIN:
+        msg = handle_time_exit()
+        send_telegram(f"(TIME) Pre-TP1 time-stop hit ({elapsed_min:.0f} min)\n\n{msg}")
+        return msg
+
+    if position["tp1_hit"] and elapsed_min >= MAX_HOLD_POST_TP1_MIN:
+        msg = handle_time_exit()
+        send_telegram(f"(TIME) Post-TP1 backstop hit ({elapsed_min:.0f} min)\n\n{msg}")
+        return msg
+
+    return None
+
+
 # ================================================================
 # WEBHOOK
 # ================================================================
 @app.route("/")
 def home():
+    check_time_stop()
     status = "ACTIVE" if position["active"] else "IDLE"
-    return f"ESS FLOKI 8X -- Claude + LBank | Position: {status}", 200
+    return f"ESS FLOKI Quick-Scalp -- Claude + LBank | Position: {status}", 200
 
 
 @app.route("/status")
@@ -529,7 +584,6 @@ def webhook():
         action     = ""
         setup_type = ""
 
-        # Route by signal
         if signal in ("ESS A+ SETUP", "ESS A SETUP"):
             analysis   = ask_claude(data)
             action     = parse_action(analysis)
@@ -554,6 +608,9 @@ def webhook():
         elif signal == "ESS INVALIDATED":
             result_msg = handle_invalidated(data)
 
+        elif signal == "ESS TIME EXIT":
+            result_msg = handle_time_exit()
+
         elif signal in ("ESS SWEEP DETECTED", "ESS RECLAIM CONFIRMED", "ESS RETEST HOLD"):
             steps = {
                 "ESS SWEEP DETECTED":    "Step 1 done -- sweep confirmed. Watching for reclaim.",
@@ -565,13 +622,13 @@ def webhook():
         else:
             result_msg = f"Signal received: {signal}"
 
-        # Build Telegram message
         badges = {
             "ESS A+ SETUP": "(A+)", "ESS A SETUP": "(A)",
             "ESS TP1 HIT": "(TP1)", "ESS TP2 HIT": "(TP2)",
             "ESS TP3 HIT": "(TP3)", "ESS STOP LOSS HIT": "(SL)",
-            "ESS INVALIDATED": "(INV)", "ESS SWEEP DETECTED": "(SW)",
-            "ESS RECLAIM CONFIRMED": "(RC)", "ESS RETEST HOLD": "(RT)",
+            "ESS INVALIDATED": "(INV)", "ESS TIME EXIT": "(TIME)",
+            "ESS SWEEP DETECTED": "(SW)", "ESS RECLAIM CONFIRMED": "(RC)",
+            "ESS RETEST HOLD": "(RT)",
         }
         badge = badges.get(signal, "(i)")
         tg    = f"{badge} {ticker} @ {price}\n{signal}\n\n"
@@ -602,5 +659,5 @@ def webhook():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print(f"ESS FLOKI 8X starting on port {port}")
+    print(f"ESS FLOKI Quick-Scalp starting on port {port}")
     app.run(host="0.0.0.0", port=port)
