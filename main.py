@@ -105,19 +105,43 @@ Action: [ENTER NOW / WAIT / NO TRADE]"""
 
 # ================================================================
 # LBANK
+# LBank's required signing process (confirmed against official docs):
+#   1. Sort business params alphabetically, build query string
+#   2. MD5 hash that string, UPPERCASE the hex digest  -> preparedStr
+#   3. HMAC-SHA256 sign preparedStr with the secret key -> sign
+# Every signed request also needs THREE auth headers (separate from
+# the signed params): timestamp, signature_method, echostr.
+# Missing any of these produces error_code 10202 ("...can not be null").
 # ================================================================
 def lbank_sign(params):
     sorted_params = "&".join(
         f"{k}={v}" for k, v in sorted(params.items())
     )
+    prepared_str = hashlib.md5(sorted_params.encode("utf-8")).hexdigest().upper()
     return hmac.new(
         LBANK_SECRET_KEY.encode("utf-8"),
-        sorted_params.encode("utf-8"),
+        prepared_str.encode("utf-8"),
         hashlib.sha256
-    ).hexdigest().upper()
+    ).hexdigest()
 
 def lbank_ts():
     return str(int(time.time() * 1000))
+
+def lbank_echostr():
+    """LBank requires a random alphanumeric string, length 30-40, per request"""
+    import random
+    import string
+    length = random.randint(30, 40)
+    return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
+
+def lbank_headers():
+    """Required auth headers for every signed LBank request"""
+    return {
+        "Content-Type":     "application/x-www-form-urlencoded",
+        "timestamp":         lbank_ts(),
+        "signature_method": "HmacSHA256",
+        "echostr":           lbank_echostr(),
+    }
 
 def get_price(symbol):
     try:
@@ -133,11 +157,13 @@ def get_price(symbol):
 
 def get_floki_balance():
     try:
-        params = {"api_key": LBANK_API_KEY, "timestamp": lbank_ts()}
+        params = {"api_key": LBANK_API_KEY}
         params["sign"] = lbank_sign(params)
         r = requests.post(
             f"{LBANK_BASE}/v2/user_info.do",
-            data=params, timeout=10
+            data=params,
+            headers=lbank_headers(),
+            timeout=10
         )
         funds = r.json().get("data", {}).get("info", {}).get("free", {})
         return float(funds.get("floki", 0))
@@ -148,17 +174,18 @@ def get_floki_balance():
 def place_order(symbol, side, quantity):
     try:
         params = {
-            "api_key":   LBANK_API_KEY,
-            "symbol":    symbol,
-            "type":      side,
-            "price":     "0",
-            "amount":    str(round(quantity, 0)),
-            "timestamp": lbank_ts(),
+            "api_key": LBANK_API_KEY,
+            "symbol":  symbol,
+            "type":    side,
+            "price":   "0",
+            "amount":  str(round(quantity, 0)),
         }
         params["sign"] = lbank_sign(params)
         r = requests.post(
             f"{LBANK_BASE}/v2/create_order.do",
-            data=params, timeout=10
+            data=params,
+            headers=lbank_headers(),
+            timeout=10
         )
         return r.json()
     except Exception as e:
