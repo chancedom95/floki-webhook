@@ -161,11 +161,20 @@ def lbank_build_request(business_params):
     # Sign: sort all params -> MD5 uppercase -> HMAC-SHA256 uppercase
     sorted_str  = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     prepared    = hashlib.md5(sorted_str.encode("utf-8")).hexdigest().upper()
-    params["sign"] = hmac.new(
+    sign        = hmac.new(
         LBANK_SECRET_KEY.encode("utf-8"),
         prepared.encode("utf-8"),
         hashlib.sha256
     ).hexdigest().upper()
+    params["sign"] = sign
+
+    # Debug logging -- visible in Railway logs
+    print(f"[LBANK DEBUG] sorted_str : {sorted_str}")
+    print(f"[LBANK DEBUG] MD5 prepared: {prepared}")
+    print(f"[LBANK DEBUG] final sign  : {sign}")
+    print(f"[LBANK DEBUG] echostr     : {echo}")
+    print(f"[LBANK DEBUG] timestamp   : {ts}")
+    print(f"[LBANK DEBUG] api_key     : {LBANK_API_KEY}")
 
     # Headers carry the same echostr/timestamp used in signing
     headers = {
@@ -221,6 +230,7 @@ def place_order(symbol, side, quantity):
             headers=headers,
             timeout=10
         )
+        print(f"[LBANK DEBUG] create_order raw response: {r.text}")
         return r.json()
     except Exception as e:
         return {"error": str(e)}
