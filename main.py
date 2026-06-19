@@ -225,22 +225,38 @@ def get_floki_balance():
         print(f"Balance error: {e}")
         return 0.0
 
-def place_order(symbol, side, quantity):
+def place_order(symbol, side, quantity, limit_price=None):
     """
-    side="buy":  quantity is USDT to spend  -> buy_market (no price field)
-    side="sell": quantity is FLOKI to sell  -> sell_market (no price field)
+    Limit order at current market price -- fills immediately as a taker,
+    identical in practice to a market order.
 
-    Removing price=0 entirely fixes the persistent 10007:
-    LBank normalizes "0" to "0.00000000" before hashing on their side,
-    but our hash used "0" -- different strings, different signature.
-    Market orders need no price field, so we omit it completely.
+    buy_market / sell_market return error 10008 (pair nonsupport) on
+    LBank for floki_usdt. Limit orders with type="buy"/"sell" work.
+
+    side="buy":  quantity = FLOKI to buy.   limit_price = entry price.
+    side="sell": quantity = FLOKI to sell.  limit_price = current price.
+
+    If limit_price is not provided, it is fetched live from the ticker.
+    For sells, price is set slightly below market to guarantee taker fill.
     """
     try:
-        order_type = "buy_market" if side == "buy" else "sell_market"
+        if limit_price is None:
+            limit_price = get_price(symbol)
+        if limit_price <= 0:
+            return {"error": "Price feed returned zero"}
+
+        # Buys: use exact entry price (from alert).
+        # Sells: set 0.3% below live price to guarantee immediate fill.
+        if side == "sell":
+            limit_price = limit_price * 0.997
+
+        price_str = f"{limit_price:.8f}"
+
         business = {
             "api_key": LBANK_API_KEY,
             "symbol":  symbol,
-            "type":    order_type,
+            "type":    side,          # "buy" or "sell"
+            "price":   price_str,
             "amount":  str(int(round(quantity, 0))),
         }
         params, headers = lbank_build_request(business)
@@ -367,7 +383,7 @@ def handle_entry(data, analysis, setup_type):
         return "Calculated FLOKI quantity is zero -- check price feed"
 
     print(f"[ORDER] USDT size: {usdt_size} | price: {entry_px} | FLOKI qty: {floki_qty}")
-    result = place_order(symbol, "buy", floki_qty)
+    result = place_order(symbol, "buy", floki_qty, limit_price=entry_px)
     print(f"Entry result: {result}")
 
     if result.get("result") == "true":
