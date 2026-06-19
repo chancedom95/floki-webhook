@@ -128,31 +128,55 @@ Action: [ENTER NOW / WAIT / NO TRADE]"""
 # Every signed request also needs THREE auth headers (separate from
 # the signed params): timestamp, signature_method, echostr.
 # ================================================================
-def lbank_sign(params):
-    sorted_params = "&".join(
-        f"{k}={v}" for k, v in sorted(params.items())
+def lbank_build_request(business_params):
+    """
+    Build a signed LBank request correctly.
+
+    LBank's signing process requires echostr, signature_method, and
+    timestamp to be included in the params that get MD5-hashed and
+    signed -- AND sent as HTTP headers with the exact same values.
+
+    The previous bug: lbank_headers() generated fresh echostr/timestamp
+    values independently from lbank_sign(), so the signed values and
+    the header values were always different. LBank verifies the signature
+    against the headers it receives, so they never matched -> 10007.
+
+    Fix: generate echostr and timestamp once, include them in the signed
+    params AND build headers from those same values.
+
+    Returns: (params_dict_with_sign, headers_dict)
+    """
+    ts      = str(int(time.time() * 1000))
+    echo    = "".join(
+        random.choice(string.ascii_letters + string.digits)
+        for _ in range(random.randint(30, 40))
     )
-    prepared_str = hashlib.md5(sorted_params.encode("utf-8")).hexdigest().upper()
-    return hmac.new(
+
+    # All params that get sorted and MD5'd -- includes auth fields
+    params = dict(business_params)
+    params["echostr"]          = echo
+    params["signature_method"] = "HmacSHA256"
+    params["timestamp"]        = ts
+
+    # Sign: sort all params -> MD5 uppercase -> HMAC-SHA256 uppercase
+    sorted_str  = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    prepared    = hashlib.md5(sorted_str.encode("utf-8")).hexdigest().upper()
+    params["sign"] = hmac.new(
         LBANK_SECRET_KEY.encode("utf-8"),
-        prepared_str.encode("utf-8"),
+        prepared.encode("utf-8"),
         hashlib.sha256
     ).hexdigest().upper()
 
-def lbank_ts():
-    return str(int(time.time() * 1000))
-
-def lbank_echostr():
-    length = random.randint(30, 40)
-    return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
-
-def lbank_headers():
-    return {
+    # Headers carry the same echostr/timestamp used in signing
+    headers = {
         "Content-Type":     "application/x-www-form-urlencoded",
-        "timestamp":         lbank_ts(),
+        "timestamp":         ts,
         "signature_method": "HmacSHA256",
-        "echostr":           lbank_echostr(),
+        "echostr":           echo,
     }
+
+    return params, headers
+
 
 def get_price(symbol):
     try:
@@ -168,12 +192,11 @@ def get_price(symbol):
 
 def get_floki_balance():
     try:
-        params = {"api_key": LBANK_API_KEY}
-        params["sign"] = lbank_sign(params)
+        params, headers = lbank_build_request({"api_key": LBANK_API_KEY})
         r = requests.post(
             f"{LBANK_BASE}/v2/user_info.do",
             data=params,
-            headers=lbank_headers(),
+            headers=headers,
             timeout=10
         )
         funds = r.json().get("data", {}).get("info", {}).get("free", {})
@@ -184,18 +207,18 @@ def get_floki_balance():
 
 def place_order(symbol, side, quantity):
     try:
-        params = {
+        business = {
             "api_key": LBANK_API_KEY,
             "symbol":  symbol,
             "type":    side,
             "price":   "0",
             "amount":  str(round(quantity, 0)),
         }
-        params["sign"] = lbank_sign(params)
+        params, headers = lbank_build_request(business)
         r = requests.post(
             f"{LBANK_BASE}/v2/create_order.do",
             data=params,
-            headers=lbank_headers(),
+            headers=headers,
             timeout=10
         )
         return r.json()
