@@ -130,53 +130,49 @@ Action: [ENTER NOW / WAIT / NO TRADE]"""
 # ================================================================
 def lbank_build_request(business_params):
     """
-    Build a signed LBank request correctly.
+    Correct LBank v2 spot signing (confirmed from debug logs):
 
-    LBank's signing process requires echostr, signature_method, and
-    timestamp to be included in the params that get MD5-hashed and
-    signed -- AND sent as HTTP headers with the exact same values.
+    LBank has TWO separate validation layers:
+      1. Headers check (10202): timestamp, signature_method, echostr
+         must be present as HTTP headers. Checked independently.
+      2. Signature check (10007): sign must match MD5+HMAC of ONLY
+         the business params (api_key + endpoint params), sorted.
+         echostr/timestamp/signature_method are NOT part of this hash.
 
-    The previous bug: lbank_headers() generated fresh echostr/timestamp
-    values independently from lbank_sign(), so the signed values and
-    the header values were always different. LBank verifies the signature
-    against the headers it receives, so they never matched -> 10007.
+    Previous bug: we were including echostr/timestamp/signature_method
+    IN the sorted params string, so our hash covered different params
+    than what LBank verifies. That mismatch produced 10007 every time
+    regardless of whether the algorithm itself was correct.
 
-    Fix: generate echostr and timestamp once, include them in the signed
-    params AND build headers from those same values.
-
-    Returns: (params_dict_with_sign, headers_dict)
+    Fix: sign only business params. Send auth fields as headers only.
     """
-    ts      = str(int(time.time() * 1000))
-    echo    = "".join(
+    ts   = str(int(time.time() * 1000))
+    echo = "".join(
         random.choice(string.ascii_letters + string.digits)
         for _ in range(random.randint(30, 40))
     )
 
-    # All params that get sorted and MD5'd -- includes auth fields
-    params = dict(business_params)
-    params["echostr"]          = echo
-    params["signature_method"] = "HmacSHA256"
-    params["timestamp"]        = ts
-
-    # Sign: sort all params -> MD5 uppercase -> HMAC-SHA256 uppercase
-    sorted_str  = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    prepared    = hashlib.md5(sorted_str.encode("utf-8")).hexdigest().upper()
-    sign        = hmac.new(
+    # Sign ONLY business params -- no echostr/timestamp/signature_method
+    sorted_str = "&".join(
+        f"{k}={v}" for k, v in sorted(business_params.items())
+    )
+    prepared = hashlib.md5(sorted_str.encode("utf-8")).hexdigest().upper()
+    sign     = hmac.new(
         LBANK_SECRET_KEY.encode("utf-8"),
         prepared.encode("utf-8"),
         hashlib.sha256
     ).hexdigest().upper()
-    params["sign"] = sign
 
-    # Debug logging -- visible in Railway logs
+    # POST body: business params + sign only
+    post_params = dict(business_params)
+    post_params["sign"] = sign
+
+    # Debug logging
     print(f"[LBANK DEBUG] sorted_str : {sorted_str}")
-    print(f"[LBANK DEBUG] MD5 prepared: {prepared}")
-    print(f"[LBANK DEBUG] final sign  : {sign}")
-    print(f"[LBANK DEBUG] echostr     : {echo}")
-    print(f"[LBANK DEBUG] timestamp   : {ts}")
-    print(f"[LBANK DEBUG] api_key     : {LBANK_API_KEY}")
+    print(f"[LBANK DEBUG] MD5        : {prepared}")
+    print(f"[LBANK DEBUG] sign       : {sign}")
 
-    # Headers carry the same echostr/timestamp used in signing
+    # Auth fields go ONLY in headers -- verified separately from signature
     headers = {
         "Content-Type":     "application/x-www-form-urlencoded",
         "timestamp":         ts,
@@ -184,7 +180,7 @@ def lbank_build_request(business_params):
         "echostr":           echo,
     }
 
-    return params, headers
+    return post_params, headers
 
 
 def get_price(symbol):
@@ -221,7 +217,7 @@ def place_order(symbol, side, quantity):
             "symbol":  symbol,
             "type":    side,
             "price":   "0",
-            "amount":  str(round(quantity, 0)),
+            "amount":  str(int(round(quantity, 0))),
         }
         params, headers = lbank_build_request(business)
         r = requests.post(
