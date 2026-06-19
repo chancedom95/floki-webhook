@@ -130,21 +130,9 @@ Action: [ENTER NOW / WAIT / NO TRADE]"""
 # ================================================================
 def lbank_build_request(business_params):
     """
-    Correct LBank v2 spot signing (confirmed from debug logs):
-
-    LBank has TWO separate validation layers:
-      1. Headers check (10202): timestamp, signature_method, echostr
-         must be present as HTTP headers. Checked independently.
-      2. Signature check (10007): sign must match MD5+HMAC of ONLY
-         the business params (api_key + endpoint params), sorted.
-         echostr/timestamp/signature_method are NOT part of this hash.
-
-    Previous bug: we were including echostr/timestamp/signature_method
-    IN the sorted params string, so our hash covered different params
-    than what LBank verifies. That mismatch produced 10007 every time
-    regardless of whether the algorithm itself was correct.
-
-    Fix: sign only business params. Send auth fields as headers only.
+    LBank v2 signing -- all variants logged for diagnosis.
+    Currently trying: echostr+ts+sm IN signed params (as per contract
+    API docs), buy_market, no price, lowercase HMAC output.
     """
     ts   = str(int(time.time() * 1000))
     echo = "".join(
@@ -152,27 +140,54 @@ def lbank_build_request(business_params):
         for _ in range(random.randint(30, 40))
     )
 
-    # Sign ONLY business params -- no echostr/timestamp/signature_method
-    sorted_str = "&".join(
+    # --- Variant A: business params only (no auth fields in sign) ---
+    sorted_A = "&".join(
         f"{k}={v}" for k, v in sorted(business_params.items())
     )
-    prepared = hashlib.md5(sorted_str.encode("utf-8")).hexdigest().upper()
-    sign     = hmac.new(
-        LBANK_SECRET_KEY.encode("utf-8"),
-        prepared.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest().upper()
+    md5_A = hashlib.md5(sorted_A.encode("utf-8")).hexdigest().upper()
+    key_utf8 = LBANK_SECRET_KEY.encode("utf-8")
+    signA_up  = hmac.new(key_utf8, md5_A.encode("utf-8"), hashlib.sha256).hexdigest().upper()
+    signA_lo  = hmac.new(key_utf8, md5_A.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    # POST body: business params + sign only
-    post_params = dict(business_params)
-    post_params["sign"] = sign
+    # --- Variant B: all params including echostr/ts/sm in sign ---
+    all_params = dict(business_params)
+    all_params["echostr"]          = echo
+    all_params["signature_method"] = "HmacSHA256"
+    all_params["timestamp"]        = ts
+    sorted_B = "&".join(
+        f"{k}={v}" for k, v in sorted(all_params.items())
+    )
+    md5_B = hashlib.md5(sorted_B.encode("utf-8")).hexdigest().upper()
+    signB_up  = hmac.new(key_utf8, md5_B.encode("utf-8"), hashlib.sha256).hexdigest().upper()
+    signB_lo  = hmac.new(key_utf8, md5_B.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    # Debug logging
-    print(f"[LBANK DEBUG] sorted_str : {sorted_str}")
-    print(f"[LBANK DEBUG] MD5        : {prepared}")
-    print(f"[LBANK DEBUG] sign       : {sign}")
+    # --- Variant C: hex-decoded key (in case key is hex-encoded) ---
+    try:
+        key_hex = bytes.fromhex(LBANK_SECRET_KEY)
+        signC_up = hmac.new(key_hex, md5_A.encode("utf-8"), hashlib.sha256).hexdigest().upper()
+        signC_lo = hmac.new(key_hex, md5_A.encode("utf-8"), hashlib.sha256).hexdigest()
+    except Exception:
+        signC_up = signC_lo = "KEY_NOT_HEX"
 
-    # Auth fields go ONLY in headers -- verified separately from signature
+    # Log all variants
+    print(f"[SIGN] sorted_A (business only): {sorted_A}")
+    print(f"[SIGN] sorted_B (+ auth fields): {sorted_B}")
+    print(f"[SIGN] A_upper : {signA_up}")
+    print(f"[SIGN] A_lower : {signA_lo}")
+    print(f"[SIGN] B_upper : {signB_up}")
+    print(f"[SIGN] B_lower : {signB_lo}")
+    print(f"[SIGN] C_upper (hexkey+A): {signC_up}")
+    print(f"[SIGN] C_lower (hexkey+A): {signC_lo}")
+
+    # TRYING: Variant B_lower (all params + lowercase HMAC)
+    # This matches LBank contract API docs + CCXT lowercase convention
+    active_sign = signB_lo
+    print(f"[SIGN] SENDING: B_lower = {active_sign}")
+
+    # POST body: all params (echostr/ts/sm in body too) + sign
+    post_params = dict(all_params)
+    post_params["sign"] = active_sign
+
     headers = {
         "Content-Type":     "application/x-www-form-urlencoded",
         "timestamp":         ts,
