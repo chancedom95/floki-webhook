@@ -351,8 +351,23 @@ def handle_entry(data, analysis, setup_type):
     symbol    = "floki_usdt"
     usdt_size = TRADE_SIZE_AP if setup_type == "A+" else TRADE_SIZE_A
 
-    # Pass USDT amount directly -- place_order uses buy_market internally
-    result = place_order(symbol, "buy", usdt_size)
+    # For buy_market on LBank, amount = FLOKI quantity (base currency), not USDT.
+    # Get entry price from alert data, calculate FLOKI qty to buy.
+    try:
+        entry_px = float(data.get("entry", data.get("close", 0)))
+    except (TypeError, ValueError):
+        entry_px = 0.0
+    if entry_px <= 0:
+        entry_px = get_price(symbol)
+    if entry_px <= 0:
+        return "Could not determine FLOKI price for order sizing"
+
+    floki_qty = int(usdt_size / entry_px)
+    if floki_qty <= 0:
+        return "Calculated FLOKI quantity is zero -- check price feed"
+
+    print(f"[ORDER] USDT size: {usdt_size} | price: {entry_px} | FLOKI qty: {floki_qty}")
+    result = place_order(symbol, "buy", floki_qty)
     print(f"Entry result: {result}")
 
     if result.get("result") == "true":
@@ -370,8 +385,7 @@ def handle_entry(data, analysis, setup_type):
         time.sleep(1)
         qty = get_floki_balance()
         if qty <= 0:
-            # Fallback estimate if balance query fails
-            qty = usdt_size / price if price > 0 else 0
+            qty = float(floki_qty)  # fallback to calculated qty
 
         position.update({
             "active":             True,
