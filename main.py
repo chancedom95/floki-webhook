@@ -137,7 +137,7 @@ def lbank_sign(params):
         LBANK_SECRET_KEY.encode("utf-8"),
         prepared_str.encode("utf-8"),
         hashlib.sha256
-    ).hexdigest()
+    ).hexdigest().upper()
 
 def lbank_ts():
     return str(int(time.time() * 1000))
@@ -150,7 +150,7 @@ def lbank_headers():
     return {
         "Content-Type":     "application/x-www-form-urlencoded",
         "timestamp":         lbank_ts(),
-        "signature_method": "hmacsha256",
+        "signature_method": "HmacSHA256",
         "echostr":           lbank_echostr(),
     }
 
