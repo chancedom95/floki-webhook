@@ -211,12 +211,21 @@ def get_floki_balance():
         return 0.0
 
 def place_order(symbol, side, quantity):
+    """
+    side="buy":  quantity is USDT to spend  -> buy_market (no price field)
+    side="sell": quantity is FLOKI to sell  -> sell_market (no price field)
+
+    Removing price=0 entirely fixes the persistent 10007:
+    LBank normalizes "0" to "0.00000000" before hashing on their side,
+    but our hash used "0" -- different strings, different signature.
+    Market orders need no price field, so we omit it completely.
+    """
     try:
+        order_type = "buy_market" if side == "buy" else "sell_market"
         business = {
             "api_key": LBANK_API_KEY,
             "symbol":  symbol,
-            "type":    side,
-            "price":   "0",
+            "type":    order_type,
             "amount":  str(int(round(quantity, 0))),
         }
         params, headers = lbank_build_request(business)
@@ -230,12 +239,6 @@ def place_order(symbol, side, quantity):
         return r.json()
     except Exception as e:
         return {"error": str(e)}
-
-def calc_qty(symbol, usdt_amount):
-    price = get_price(symbol)
-    if price <= 0:
-        return 0.0
-    return round(usdt_amount / price, 0)
 
 
 # ================================================================
@@ -332,11 +335,9 @@ def handle_entry(data, analysis, setup_type):
 
     symbol    = "floki_usdt"
     usdt_size = TRADE_SIZE_AP if setup_type == "A+" else TRADE_SIZE_A
-    qty       = calc_qty(symbol, usdt_size)
-    if qty <= 0:
-        return "Could not calculate quantity"
 
-    result = place_order(symbol, "buy", qty)
+    # Pass USDT amount directly -- place_order uses buy_market internally
+    result = place_order(symbol, "buy", usdt_size)
     print(f"Entry result: {result}")
 
     if result.get("result") == "true":
@@ -349,6 +350,13 @@ def handle_entry(data, analysis, setup_type):
             tp3   = float(data.get("tp3", 0))
         except (TypeError, ValueError):
             price, sl, tp1, tp2, tp3 = float(data.get("close", 0)), 0.0, 0.0, 0.0, 0.0
+
+        # Get actual FLOKI balance after market order fills
+        time.sleep(1)
+        qty = get_floki_balance()
+        if qty <= 0:
+            # Fallback estimate if balance query fails
+            qty = usdt_size / price if price > 0 else 0
 
         position.update({
             "active":             True,
